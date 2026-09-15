@@ -37,7 +37,7 @@ CATEGORY_BRIDGE_FILE = DATA_DIR / "sgjob_v3_category_bridge.csv"
 SKILL_BRIDGE_PARQUET = DATA_DIR / "sgjob_v3_skill_bridge.parquet"
 SKILL_BRIDGE_FILE = DATA_DIR / "sgjob_v3_skill_bridge.csv"
 
-DEPLOYMENT_CACHE_VERSION = "validated_v3_deploy_1"
+DEPLOYMENT_CACHE_VERSION = "validated_v3_cloud_memory_2"
 
 
 # Only load columns actually needed by the dashboard.
@@ -59,12 +59,10 @@ WANTED_COLUMNS = [
     "vacancy_band",
 
     # Seniority
-    "position_level_clean",
     "seniority_group",
 
     # Demand / competition
     "metadata_total_number_job_application",
-    "metadata_total_number_of_view",
     "applications_per_vacancy",
     "views_per_vacancy",
     "application_rate",
@@ -78,23 +76,14 @@ WANTED_COLUMNS = [
     "month_year",
     "month_year_sort",
     "metadata_new_posting_date",
-    "metadata_expiry_date",
-    "posting_duration_days",
     "is_reposted",
 
     # Skills convenience field
     "skill_tags",
-    "skill_count",
 
-    # Team 6 review / data-quality fields
+    # Data-quality review fields actually displayed
     "job_id_format",
-    "random_job_review_flag",
-    "salary_high_review_flag",
-    "experience_high_review_flag",
-    "vacancy_high_review_flag",
-    "vacancy_999_review_flag",
     "needs_source_review",
-    "duplicate_job_id",
     "has_data_quality_issue",
 ]
 
@@ -115,16 +104,130 @@ def available_parquet_columns(path):
     return pq.ParquetFile(path).schema.names
 
 
-@st.cache_data(show_spinner="Loading category bridge...")
+def _to_arrow_string(series):
+    """Use compact Arrow-backed strings when available."""
+    try:
+        return series.astype("string[pyarrow]")
+    except Exception:
+        return series.astype("string")
+
+
+def optimize_bridge_memory(data, label_col):
+    """Compact the two bridge columns without changing their values."""
+    if data.empty:
+        return data
+
+    if "job_post_id" in data.columns:
+        data["job_post_id"] = _to_arrow_string(data["job_post_id"])
+
+    if label_col in data.columns:
+        data[label_col] = data[label_col].astype("category")
+
+    return data
+
+
+def optimize_main_memory(data):
+    """Compact dtypes once inside the shared cloud cache."""
+    # High-cardinality text: Arrow strings use far less RAM than Python objects.
+    for col in ["metadata_job_post_id", "title_clean", "skill_tags"]:
+        if col in data.columns:
+            data[col] = _to_arrow_string(data[col])
+
+    # Repeated labels: categorical storage is compact and preserves labels.
+    for col in [
+        "employment_types",
+        "category_primary",
+        "salary_band",
+        "experience_band",
+        "vacancy_band",
+        "seniority_group",
+        "opportunity_band",
+        "month_year",
+        "job_id_format",
+    ]:
+        if col in data.columns:
+            data[col] = data[col].astype("category")
+
+    # Numeric conversion used by the validated dashboard.
+    for col in [
+        "salary_minimum",
+        "salary_maximum",
+        "salary_midpoint",
+        "minimum_years_experience",
+        "number_of_vacancies",
+        "metadata_total_number_job_application",
+        "applications_per_vacancy",
+        "views_per_vacancy",
+        "application_rate",
+        "opportunity_score",
+        "posting_year",
+        "month_year_sort",
+    ]:
+        if col in data.columns:
+            data[col] = pd.to_numeric(data[col], errors="coerce")
+
+    # Safe downcasts for cloud RAM. Displayed KPI precision is unchanged.
+    for col in [
+        "minimum_years_experience",
+        "applications_per_vacancy",
+        "views_per_vacancy",
+        "application_rate",
+        "opportunity_score",
+    ]:
+        if col in data.columns:
+            data[col] = pd.to_numeric(data[col], downcast="float")
+
+    for col in [
+        "number_of_vacancies",
+        "metadata_total_number_job_application",
+        "posting_year",
+        "month_year_sort",
+    ]:
+        if col in data.columns:
+            data[col] = pd.to_numeric(data[col], downcast="integer")
+
+    if "metadata_new_posting_date" in data.columns:
+        data["metadata_new_posting_date"] = pd.to_datetime(
+            data["metadata_new_posting_date"], errors="coerce"
+        )
+
+    if "posting_year" not in data.columns and "metadata_new_posting_date" in data.columns:
+        data["posting_year"] = data["metadata_new_posting_date"].dt.year
+
+    if "month_year" not in data.columns and "metadata_new_posting_date" in data.columns:
+        data["month_year"] = (
+            data["metadata_new_posting_date"].dt.to_period("M").astype("category")
+        )
+
+    if "month_year_sort" not in data.columns and "metadata_new_posting_date" in data.columns:
+        data["month_year_sort"] = (
+            data["metadata_new_posting_date"].dt.year * 100
+            + data["metadata_new_posting_date"].dt.month
+        )
+        data["month_year_sort"] = pd.to_numeric(
+            data["month_year_sort"], downcast="integer"
+        )
+
+    return data
+
+
+def unique_strings(series, preserve_order=False):
+    """Get distinct labels without converting an entire million-row column to str."""
+    values = [str(v) for v in series.dropna().unique().tolist()]
+    return values if preserve_order else sorted(values)
+
+
+@st.cache_resource(show_spinner="Loading category bridge...")
 def load_category_bridge(cache_version):
     """Load only the two columns needed for category analysis."""
     required = ["job_post_id", "category_name"]
 
     if CATEGORY_BRIDGE_PARQUET.exists():
-        return pd.read_parquet(
+        data = pd.read_parquet(
             CATEGORY_BRIDGE_PARQUET,
             columns=required,
         )
+        return optimize_bridge_memory(data, "category_name")
 
     if not CATEGORY_BRIDGE_FILE.exists():
         return pd.DataFrame(columns=required)
@@ -133,23 +236,25 @@ def load_category_bridge(cache_version):
     if not all(col in header.columns for col in required):
         return pd.DataFrame(columns=required)
 
-    return pd.read_csv(
+    data = pd.read_csv(
         CATEGORY_BRIDGE_FILE,
         usecols=required,
         low_memory=True,
     )
+    return optimize_bridge_memory(data, "category_name")
 
 
-@st.cache_data(show_spinner="Loading skill bridge...")
+@st.cache_resource(show_spinner="Loading skill bridge...")
 def load_skill_bridge(cache_version):
     """Load only the two columns needed for skill analysis."""
     required = ["job_post_id", "skill_name"]
 
     if SKILL_BRIDGE_PARQUET.exists():
-        return pd.read_parquet(
+        data = pd.read_parquet(
             SKILL_BRIDGE_PARQUET,
             columns=required,
         )
+        return optimize_bridge_memory(data, "skill_name")
 
     if not SKILL_BRIDGE_FILE.exists():
         return pd.DataFrame(columns=required)
@@ -158,14 +263,15 @@ def load_skill_bridge(cache_version):
     if not all(col in header.columns for col in required):
         return pd.DataFrame(columns=required)
 
-    return pd.read_csv(
+    data = pd.read_csv(
         SKILL_BRIDGE_FILE,
         usecols=required,
         low_memory=True,
     )
+    return optimize_bridge_memory(data, "skill_name")
 
 
-@st.cache_data(show_spinner="Loading optimized SGJobs dataset...")
+@st.cache_resource(show_spinner="Loading optimized SGJobs dataset...")
 def load_dashboard_data(path_string, wanted_columns, cache_version):
     """
     Load only dashboard columns.
@@ -189,7 +295,7 @@ def load_dashboard_data(path_string, wanted_columns, cache_version):
             low_memory=True,
         )
 
-    return data
+    return optimize_main_memory(data)
 
 
 def fmt_number(value):
@@ -257,91 +363,7 @@ df = load_dashboard_data(
 category_bridge = load_category_bridge(DEPLOYMENT_CACHE_VERSION)
 skill_bridge = load_skill_bridge(DEPLOYMENT_CACHE_VERSION)
 
-# Repeated labels are stored as categories to reduce memory.
-if (
-    not category_bridge.empty
-    and "category_name" in category_bridge.columns
-):
-    category_bridge["category_name"] = (
-        category_bridge["category_name"]
-        .astype("category")
-    )
-
-if (
-    not skill_bridge.empty
-    and "skill_name" in skill_bridge.columns
-):
-    skill_bridge["skill_name"] = (
-        skill_bridge["skill_name"]
-        .astype("category")
-    )
-
-
-# ============================================================
-# LIGHTWEIGHT DATA PREPARATION
-# ============================================================
-
-# Numeric columns.
-for col in [
-    "salary_midpoint",
-    "number_of_vacancies",
-    "opportunity_score",
-    "posting_year",
-    "month_year_sort",
-]:
-    if col in df.columns:
-        df[col] = pd.to_numeric(df[col], errors="coerce")
-
-
-# Date column only if needed.
-if "metadata_new_posting_date" in df.columns:
-    df["metadata_new_posting_date"] = pd.to_datetime(
-        df["metadata_new_posting_date"],
-        errors="coerce",
-    )
-
-
-# Derive posting_year only if it is missing.
-if (
-    "posting_year" not in df.columns
-    and "metadata_new_posting_date" in df.columns
-):
-    df["posting_year"] = df["metadata_new_posting_date"].dt.year
-
-
-# Derive month_year only if it is missing.
-if (
-    "month_year" not in df.columns
-    and "metadata_new_posting_date" in df.columns
-):
-    df["month_year"] = (
-        df["metadata_new_posting_date"]
-        .dt.to_period("M")
-        .astype("string")
-    )
-
-
-# Derive month_year_sort only if it is missing.
-if (
-    "month_year_sort" not in df.columns
-    and "metadata_new_posting_date" in df.columns
-):
-    df["month_year_sort"] = (
-        df["metadata_new_posting_date"].dt.year * 100
-        + df["metadata_new_posting_date"].dt.month
-    )
-
-
-# Use categorical dtype for repeated text fields to save RAM.
-for col in [
-    "employment_types",
-    "category_primary",
-    "salary_band",
-    "opportunity_band",
-    "month_year",
-]:
-    if col in df.columns:
-        df[col] = df[col].astype("category")
+# Dtypes are compacted once inside the shared cache loaders above.
 
 
 # ============================================================
@@ -353,7 +375,7 @@ st.caption(
     "V3 baseline: 1,044,597 validated logical records | "
     "Expanded Power BI-equivalent analysis + multi-label bridges"
 )
-st.caption("Deployment build: repository-relative data paths; validated local app remains separate.")
+st.caption("Cloud-memory build: shared caches + compact dtypes; validated local app remains separate.")
 
 source_label = (
     "Parquet"
@@ -379,11 +401,7 @@ employment_selected = []
 
 if "employment_types" in df.columns:
     employment_options = sorted(
-        df["employment_types"]
-        .dropna()
-        .astype(str)
-        .unique()
-        .tolist()
+unique_strings(df["employment_types"])
     )
 
     employment_selected = st.sidebar.multiselect(
@@ -397,11 +415,7 @@ job_function_selected = []
 
 if "category_primary" in df.columns:
     job_function_options = sorted(
-        df["category_primary"]
-        .dropna()
-        .astype(str)
-        .unique()
-        .tolist()
+unique_strings(df["category_primary"])
     )
 
     job_function_selected = st.sidebar.multiselect(
@@ -411,7 +425,7 @@ if "category_primary" in df.columns:
     )
 
 
-# Official multi-label Job Function slicer from Team 6's category bridge.
+# Official multi-label Job Function slicer from the Team 6 category bridge.
 category_bridge_selected = []
 
 if (
@@ -419,11 +433,7 @@ if (
     and "category_name" in category_bridge.columns
 ):
     category_bridge_options = sorted(
-        category_bridge["category_name"]
-        .dropna()
-        .astype(str)
-        .unique()
-        .tolist()
+unique_strings(category_bridge["category_name"])
     )
 
     category_bridge_selected = st.sidebar.multiselect(
@@ -444,11 +454,7 @@ if (
     and "skill_name" in skill_bridge.columns
 ):
     skill_bridge_options = sorted(
-        skill_bridge["skill_name"]
-        .dropna()
-        .astype(str)
-        .unique()
-        .tolist()
+unique_strings(skill_bridge["skill_name"])
     )
 
     skill_bridge_selected = st.sidebar.multiselect(
@@ -462,11 +468,7 @@ seniority_selected = []
 
 if "seniority_group" in df.columns:
     seniority_options = sorted(
-        df["seniority_group"]
-        .dropna()
-        .astype(str)
-        .unique()
-        .tolist()
+unique_strings(df["seniority_group"])
     )
 
     seniority_selected = st.sidebar.multiselect(
@@ -480,11 +482,7 @@ experience_band_selected = []
 
 if "experience_band" in df.columns:
     experience_options = (
-        df["experience_band"]
-        .dropna()
-        .astype(str)
-        .drop_duplicates()
-        .tolist()
+unique_strings(df["experience_band"], preserve_order=True)
     )
 
     experience_band_selected = st.sidebar.multiselect(
@@ -498,11 +496,7 @@ vacancy_band_selected = []
 
 if "vacancy_band" in df.columns:
     vacancy_options = (
-        df["vacancy_band"]
-        .dropna()
-        .astype(str)
-        .drop_duplicates()
-        .tolist()
+unique_strings(df["vacancy_band"], preserve_order=True)
     )
 
     vacancy_band_selected = st.sidebar.multiselect(
@@ -525,11 +519,7 @@ if "salary_band" in df.columns:
     ]
 
     actual = set(
-        df["salary_band"]
-        .dropna()
-        .astype(str)
-        .unique()
-        .tolist()
+unique_strings(df["salary_band"])
     )
 
     salary_options = [
@@ -559,11 +549,7 @@ if "opportunity_band" in df.columns:
     ]
 
     actual = set(
-        df["opportunity_band"]
-        .dropna()
-        .astype(str)
-        .unique()
-        .tolist()
+unique_strings(df["opportunity_band"])
     )
 
     opportunity_options = [
@@ -629,18 +615,15 @@ if category_bridge_selected:
     matching_category_jobs = (
         category_bridge.loc[
             category_bridge["category_name"]
-            .astype(str)
             .isin(category_bridge_selected),
             "job_post_id",
         ]
         .dropna()
-        .astype(str)
         .unique()
     )
 
     mask &= (
         df["metadata_job_post_id"]
-        .astype(str)
         .isin(matching_category_jobs)
     )
 
@@ -649,18 +632,15 @@ if skill_bridge_selected:
     matching_skill_jobs = (
         skill_bridge.loc[
             skill_bridge["skill_name"]
-            .astype(str)
             .isin(skill_bridge_selected),
             "job_post_id",
         ]
         .dropna()
-        .astype(str)
         .unique()
     )
 
     mask &= (
         df["metadata_job_post_id"]
-        .astype(str)
         .isin(matching_skill_jobs)
     )
 
@@ -701,7 +681,16 @@ if posting_year_selected:
     )
 
 
-filtered = df.loc[mask]
+# Avoid duplicating the entire million-row DataFrame when no filter is active.
+# Boolean indexing would otherwise create a second full in-memory copy.
+if bool(mask.all()):
+    filtered = df
+    is_full_dataset = True
+else:
+    filtered = df.loc[mask]
+    is_full_dataset = False
+
+del mask
 
 
 # ============================================================
@@ -1018,6 +1007,13 @@ with overview_tab:
                 .rename_axis("Employment Type")
                 .reset_index(name="Jobs")
             )
+
+            # Altair can render a pandas Categorical axis as an empty chart on
+            # some Streamlit/Altair combinations.  This summary is tiny, so
+            # convert only the aggregated labels back to ordinary strings.
+            summary["Employment Type"] = summary["Employment Type"].astype(str)
+            summary["Jobs"] = pd.to_numeric(summary["Jobs"], errors="coerce")
+            summary = summary.loc[summary["Jobs"].fillna(0) > 0]
 
             chart = (
                 alt.Chart(summary)
@@ -1851,32 +1847,21 @@ with bridge_tab:
         "category_primary remains only for compatibility with the existing slicer."
     )
 
-    filtered_job_ids = set(
-        filtered["metadata_job_post_id"]
-        .dropna()
-        .astype(str)
-        .tolist()
-    ) if "metadata_job_post_id" in filtered.columns else set()
-
-    category_bridge_view = (
-        category_bridge[
-            category_bridge["job_post_id"]
-            .astype(str)
-            .isin(filtered_job_ids)
+    if "metadata_job_post_id" not in filtered.columns:
+        category_bridge_view = category_bridge.iloc[0:0]
+        skill_bridge_view = skill_bridge.iloc[0:0]
+    elif is_full_dataset:
+        # Reuse the cached bridges directly. Do not duplicate 1.77M + 0.48M rows.
+        category_bridge_view = category_bridge
+        skill_bridge_view = skill_bridge
+    else:
+        filtered_job_ids = filtered["metadata_job_post_id"].dropna()
+        category_bridge_view = category_bridge[
+            category_bridge["job_post_id"].isin(filtered_job_ids)
         ]
-        if filtered_job_ids
-        else category_bridge.iloc[0:0]
-    )
-
-    skill_bridge_view = (
-        skill_bridge[
-            skill_bridge["job_post_id"]
-            .astype(str)
-            .isin(filtered_job_ids)
+        skill_bridge_view = skill_bridge[
+            skill_bridge["job_post_id"].isin(filtered_job_ids)
         ]
-        if filtered_job_ids
-        else skill_bridge.iloc[0:0]
-    )
 
     bridge_left, bridge_right = st.columns(2)
 
@@ -2536,8 +2521,7 @@ with records_tab:
             job_category_rows = (
                 category_bridge[
                     category_bridge["job_post_id"]
-                    .astype(str)
-                    .eq(selected_job_id)
+                    .eq(str(selected_job_id))
                 ][
                     [
                         c
@@ -2553,8 +2537,7 @@ with records_tab:
             job_skill_rows = (
                 skill_bridge[
                     skill_bridge["job_post_id"]
-                    .astype(str)
-                    .eq(selected_job_id)
+                    .eq(str(selected_job_id))
                 ][
                     [
                         c
