@@ -37,7 +37,7 @@ CATEGORY_BRIDGE_FILE = DATA_DIR / "sgjob_v3_category_bridge.csv"
 SKILL_BRIDGE_PARQUET = DATA_DIR / "sgjob_v3_skill_bridge.parquet"
 SKILL_BRIDGE_FILE = DATA_DIR / "sgjob_v3_skill_bridge.csv"
 
-DEPLOYMENT_CACHE_VERSION = "validated_v3_cloud_memory_2"
+DEPLOYMENT_CACHE_VERSION = "validated_v3_cloud_memory_3_lazy_pages"
 
 
 # Only load columns actually needed by the dashboard.
@@ -217,6 +217,99 @@ def unique_strings(series, preserve_order=False):
     return values if preserve_order else sorted(values)
 
 
+
+@st.cache_data(show_spinner=False)
+def load_bridge_stats(cache_version):
+    import pyarrow.compute as pc
+    import pyarrow.parquet as pq
+
+    category_options = []
+    skill_options = []
+    category_job_postings = 0
+    skill_job_postings = 0
+
+    if CATEGORY_BRIDGE_PARQUET.exists():
+        labels = pq.read_table(
+            CATEGORY_BRIDGE_PARQUET,
+            columns=["category_name"],
+        )["category_name"]
+        category_options = sorted(
+            str(v.as_py()) for v in pc.unique(labels)
+            if v.as_py() is not None
+        )
+        del labels
+
+        job_ids = pq.read_table(
+            CATEGORY_BRIDGE_PARQUET,
+            columns=["job_post_id"],
+        )["job_post_id"]
+        category_job_postings = int(
+            pc.count_distinct(job_ids).as_py() or 0
+        )
+        del job_ids
+
+    if SKILL_BRIDGE_PARQUET.exists():
+        labels = pq.read_table(
+            SKILL_BRIDGE_PARQUET,
+            columns=["skill_name"],
+        )["skill_name"]
+        skill_options = sorted(
+            str(v.as_py()) for v in pc.unique(labels)
+            if v.as_py() is not None
+        )
+        del labels
+
+        job_ids = pq.read_table(
+            SKILL_BRIDGE_PARQUET,
+            columns=["job_post_id"],
+        )["job_post_id"]
+        skill_job_postings = int(
+            pc.count_distinct(job_ids).as_py() or 0
+        )
+        del job_ids
+
+    return {
+        "category_options": category_options,
+        "skill_options": skill_options,
+        "distinct_categories": len(category_options),
+        "distinct_skills": len(skill_options),
+        "category_job_postings": category_job_postings,
+        "skill_job_postings": skill_job_postings,
+    }
+
+
+@st.cache_data(show_spinner=False)
+def load_category_jobs_for_filter(selected_categories, cache_version):
+    selected_categories = list(selected_categories)
+    if not selected_categories:
+        return pd.Series(dtype="string")
+
+    data = pd.read_parquet(
+        CATEGORY_BRIDGE_PARQUET,
+        columns=["job_post_id", "category_name"],
+        filters=[("category_name", "in", selected_categories)],
+    )
+    return _to_arrow_string(
+        data["job_post_id"].dropna()
+    ).drop_duplicates()
+
+
+@st.cache_data(show_spinner=False)
+def load_skill_jobs_for_filter(selected_skills, cache_version):
+    selected_skills = list(selected_skills)
+    if not selected_skills:
+        return pd.Series(dtype="string")
+
+    data = pd.read_parquet(
+        SKILL_BRIDGE_PARQUET,
+        columns=["job_post_id", "skill_name"],
+        filters=[("skill_name", "in", selected_skills)],
+    )
+    return _to_arrow_string(
+        data["job_post_id"].dropna()
+    ).drop_duplicates()
+
+
 @st.cache_resource(show_spinner="Loading category bridge...")
 def load_category_bridge(cache_version):
     """Load only the two columns needed for category analysis."""
@@ -356,12 +449,10 @@ df = load_dashboard_data(
 )
 
 
-# Load the two bridge tables separately.
-# IMPORTANT:
-# category_primary remains the main-table field used by the existing
-# Job Function slicer and existing Job Function visuals.
-category_bridge = load_category_bridge(DEPLOYMENT_CACHE_VERSION)
-skill_bridge = load_skill_bridge(DEPLOYMENT_CACHE_VERSION)
+# Keep complete bridge tables out of memory on ordinary pages.
+bridge_stats = load_bridge_stats(DEPLOYMENT_CACHE_VERSION)
+category_bridge = None
+skill_bridge = None
 
 # Dtypes are compacted once inside the shared cache loaders above.
 
@@ -375,7 +466,7 @@ st.caption(
     "V3 baseline: 1,044,597 validated logical records | "
     "Expanded Power BI-equivalent analysis + multi-label bridges"
 )
-st.caption("Cloud-memory build: shared caches + compact dtypes; validated local app remains separate.")
+st.caption("Cloud-memory build: lazy pages + lazy bridges + compact dtypes; validated local app remains separate.")
 
 source_label = (
     "Parquet"
@@ -425,43 +516,22 @@ unique_strings(df["category_primary"])
     )
 
 
-# Official multi-label Job Function slicer from the Team 6 category bridge.
-category_bridge_selected = []
+# Bridge filter option lists are lightweight.
+category_bridge_selected = st.sidebar.multiselect(
+    "Job Function (Bridge)",
+    options=bridge_stats["category_options"],
+    key="category_bridge_filter",
+    help=(
+        "Recommended for official Job Function analysis. "
+        "A job can belong to more than one Job Function."
+    ),
+)
 
-if (
-    not category_bridge.empty
-    and "category_name" in category_bridge.columns
-):
-    category_bridge_options = sorted(
-unique_strings(category_bridge["category_name"])
-    )
-
-    category_bridge_selected = st.sidebar.multiselect(
-        "Job Function (Bridge)",
-        options=category_bridge_options,
-        key="category_bridge_filter",
-        help=(
-            "Recommended for official Job Function analysis. "
-            "A job can belong to more than one Job Function."
-        ),
-    )
-
-
-skill_bridge_selected = []
-
-if (
-    not skill_bridge.empty
-    and "skill_name" in skill_bridge.columns
-):
-    skill_bridge_options = sorted(
-unique_strings(skill_bridge["skill_name"])
-    )
-
-    skill_bridge_selected = st.sidebar.multiselect(
-        "Skill",
-        options=skill_bridge_options,
-        key="skill_bridge_filter",
-    )
+skill_bridge_selected = st.sidebar.multiselect(
+    "Skill",
+    options=bridge_stats["skill_options"],
+    key="skill_bridge_filter",
+)
 
 
 seniority_selected = []
@@ -612,36 +682,22 @@ if job_function_selected:
 
 
 if category_bridge_selected:
-    matching_category_jobs = (
-        category_bridge.loc[
-            category_bridge["category_name"]
-            .isin(category_bridge_selected),
-            "job_post_id",
-        ]
-        .dropna()
-        .unique()
+    matching_category_jobs = load_category_jobs_for_filter(
+        tuple(category_bridge_selected),
+        DEPLOYMENT_CACHE_VERSION,
     )
-
-    mask &= (
-        df["metadata_job_post_id"]
-        .isin(matching_category_jobs)
+    mask &= df["metadata_job_post_id"].isin(
+        matching_category_jobs
     )
 
 
 if skill_bridge_selected:
-    matching_skill_jobs = (
-        skill_bridge.loc[
-            skill_bridge["skill_name"]
-            .isin(skill_bridge_selected),
-            "job_post_id",
-        ]
-        .dropna()
-        .unique()
+    matching_skill_jobs = load_skill_jobs_for_filter(
+        tuple(skill_bridge_selected),
+        DEPLOYMENT_CACHE_VERSION,
     )
-
-    mask &= (
-        df["metadata_job_post_id"]
-        .isin(matching_skill_jobs)
+    mask &= df["metadata_job_post_id"].isin(
+        matching_skill_jobs
     )
 
 
@@ -805,30 +861,11 @@ repost_rate = (
 )
 
 
-# Bridge-table measures.
-distinct_categories = (
-    category_bridge["category_name"].nunique()
-    if "category_name" in category_bridge.columns
-    else 0
-)
-
-distinct_skills = (
-    skill_bridge["skill_name"].nunique()
-    if "skill_name" in skill_bridge.columns
-    else 0
-)
-
-category_job_postings = (
-    category_bridge["job_post_id"].nunique()
-    if "job_post_id" in category_bridge.columns
-    else 0
-)
-
-skill_job_postings = (
-    skill_bridge["job_post_id"].nunique()
-    if "job_post_id" in skill_bridge.columns
-    else 0
-)
+# Bridge-table measures from lightweight metadata.
+distinct_categories = bridge_stats["distinct_categories"]
+distinct_skills = bridge_stats["distinct_skills"]
+category_job_postings = bridge_stats["category_job_postings"]
+skill_job_postings = bridge_stats["skill_job_postings"]
 
 
 # ============================================================
@@ -959,29 +996,27 @@ with st.expander("Power BI / DAX-equivalent measures", expanded=False):
 
 
 # ============================================================
-# TABS
+# CLOUD PAGE NAVIGATION
 # ============================================================
+# Unlike st.tabs, this executes only the selected analytical page.
 
-(
-    overview_tab,
-    salary_tab,
-    opportunity_tab,
-    demand_tab,
-    bridge_tab,
-    quality_tab,
-    repost_tab,
-    records_tab,
-) = st.tabs(
-    [
-        "📊 Overview",
-        "💰 Salary Analysis",
-        "🎯 Opportunity Analysis",
-        "📈 Demand & Seniority",
-        "🧩 Skills & Categories",
-        "🧪 Data Quality & Outliers",
-        "🔁 Repost Analysis",
-        "📋 Detail Drillthrough",
-    ]
+PAGE_OPTIONS = [
+    "📊 Overview",
+    "💰 Salary Analysis",
+    "🎯 Opportunity Analysis",
+    "📈 Demand & Seniority",
+    "🧩 Skills & Categories",
+    "🧪 Data Quality & Outliers",
+    "🔁 Repost Analysis",
+    "📋 Detail Drillthrough",
+]
+
+selected_page = st.radio(
+    "Dashboard page",
+    PAGE_OPTIONS,
+    horizontal=True,
+    label_visibility="collapsed",
+    key="cloud_page_selector",
 )
 
 
@@ -989,7 +1024,7 @@ with st.expander("Power BI / DAX-equivalent measures", expanded=False):
 # OVERVIEW
 # ============================================================
 
-with overview_tab:
+if selected_page == "📊 Overview":
 
     col_left, col_right = st.columns(2)
 
@@ -1224,7 +1259,7 @@ with overview_tab:
 # SALARY ANALYSIS
 # ============================================================
 
-with salary_tab:
+if selected_page == "💰 Salary Analysis":
 
     salary_left, salary_right = st.columns(2)
 
@@ -1386,7 +1421,7 @@ with salary_tab:
 # OPPORTUNITY ANALYSIS
 # ============================================================
 
-with opportunity_tab:
+if selected_page == "🎯 Opportunity Analysis":
 
     st.caption(
         "Opportunity Score is exploratory/indicative, not a validated predictive model."
@@ -1552,7 +1587,7 @@ with opportunity_tab:
 # DEMAND & SENIORITY
 # ============================================================
 
-with demand_tab:
+if selected_page == "📈 Demand & Seniority":
 
     st.caption(
         "Demand measures mirror the Power BI business view. "
@@ -1839,7 +1874,14 @@ with demand_tab:
 # SKILLS & CATEGORIES
 # ============================================================
 
-with bridge_tab:
+if selected_page == "🧩 Skills & Categories":
+
+    category_bridge = load_category_bridge(
+        DEPLOYMENT_CACHE_VERSION
+    )
+    skill_bridge = load_skill_bridge(
+        DEPLOYMENT_CACHE_VERSION
+    )
 
     st.caption(
         "These visuals use the separate bridge tables. "
@@ -2014,7 +2056,7 @@ with bridge_tab:
 # DATA QUALITY & OUTLIERS
 # ============================================================
 
-with quality_tab:
+if selected_page == "🧪 Data Quality & Outliers":
 
     st.caption(
         "Team 6 treatment is Preserve source, flag anomalies, verify with "
@@ -2252,7 +2294,7 @@ with quality_tab:
 # REPOST ANALYSIS
 # ============================================================
 
-with repost_tab:
+if selected_page == "🔁 Repost Analysis":
 
     st.caption(
         "Repost analysis is descriptive. A repost flag identifies repeat posting behaviour; "
@@ -2373,7 +2415,7 @@ with repost_tab:
 # JOB RECORDS
 # ============================================================
 
-with records_tab:
+if selected_page == "📋 Detail Drillthrough":
 
     st.subheader("Filtered Job Records")
 
@@ -2518,37 +2560,47 @@ with records_tab:
                 }
             )
 
-            job_category_rows = (
-                category_bridge[
-                    category_bridge["job_post_id"]
+            # Drillthrough reads only this selected Job ID from each bridge.
+            # The complete bridge tables are not retained on this page.
+            if CATEGORY_BRIDGE_PARQUET.exists():
+                job_category_rows = pd.read_parquet(
+                    CATEGORY_BRIDGE_PARQUET,
+                    columns=["job_post_id", "category_name"],
+                    filters=[
+                        ("job_post_id", "==", str(selected_job_id))
+                    ],
+                )
+            else:
+                job_category_rows = pd.read_csv(
+                    CATEGORY_BRIDGE_FILE,
+                    usecols=["job_post_id", "category_name"],
+                    low_memory=True,
+                )
+                job_category_rows = job_category_rows[
+                    job_category_rows["job_post_id"]
+                    .astype(str)
                     .eq(str(selected_job_id))
-                ][
-                    [
-                        c
-                        for c in [
-                            "job_post_id",
-                            "category_name",
-                        ]
-                        if c in category_bridge.columns
-                    ]
                 ]
-            )
 
-            job_skill_rows = (
-                skill_bridge[
-                    skill_bridge["job_post_id"]
+            if SKILL_BRIDGE_PARQUET.exists():
+                job_skill_rows = pd.read_parquet(
+                    SKILL_BRIDGE_PARQUET,
+                    columns=["job_post_id", "skill_name"],
+                    filters=[
+                        ("job_post_id", "==", str(selected_job_id))
+                    ],
+                )
+            else:
+                job_skill_rows = pd.read_csv(
+                    SKILL_BRIDGE_FILE,
+                    usecols=["job_post_id", "skill_name"],
+                    low_memory=True,
+                )
+                job_skill_rows = job_skill_rows[
+                    job_skill_rows["job_post_id"]
+                    .astype(str)
                     .eq(str(selected_job_id))
-                ][
-                    [
-                        c
-                        for c in [
-                            "job_post_id",
-                            "skill_name",
-                        ]
-                        if c in skill_bridge.columns
-                    ]
                 ]
-            )
 
             drill_left, drill_right = st.columns(2)
 
@@ -2583,8 +2635,8 @@ with st.expander("Technical details"):
             "loaded_columns": df.columns.tolist(),
             "filtered_rows": len(filtered),
             "v3_expected_rows": 1_044_597,
-            "category_bridge_rows": len(category_bridge),
-            "skill_bridge_rows": len(skill_bridge),
+            "category_bridge_rows": bridge_stats["category_job_postings"],
+            "skill_bridge_rows": bridge_stats["skill_job_postings"],
             "distinct_categories": distinct_categories,
             "distinct_skills": distinct_skills,
             "seniority_loaded": "seniority_group" in df.columns,
